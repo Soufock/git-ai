@@ -1,5 +1,6 @@
 //! `git-ai usage` — local statistics from persisted metric events.
 
+use crate::git::repository::find_repository_in_path;
 use crate::metrics::local_stats::{
     BucketGranularity, LocalActivityStats, RepoActivitySummary, compute_all,
 };
@@ -34,6 +35,7 @@ fn resolve_period(token: &str) -> Result<(u64, String, BucketGranularity), Strin
 pub fn handle_usage(args: &[String]) {
     let mut json = false;
     let mut period = DEFAULT_PERIOD.to_string();
+    let mut repo_filter: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -55,8 +57,36 @@ pub fn handle_usage(args: &[String]) {
                     }
                 }
             }
+            "--repo" => {
+                i += 1;
+                match args.get(i) {
+                    Some(value) => match resolve_repo_filter(value) {
+                        Ok(resolved) => repo_filter = Some(resolved),
+                        Err(err) => {
+                            eprintln!("{}", err);
+                            eprintln!("Run 'git-ai usage --help' for usage.");
+                            std::process::exit(1);
+                        }
+                    },
+                    None => {
+                        eprintln!("Missing value for --repo.");
+                        eprintln!("Run 'git-ai usage --help' for usage.");
+                        std::process::exit(1);
+                    }
+                }
+            }
             _ if arg.starts_with("--period=") => {
                 period = arg["--period=".len()..].to_string();
+            }
+            _ if arg.starts_with("--repo=") => {
+                match resolve_repo_filter(&arg["--repo=".len()..]) {
+                    Ok(resolved) => repo_filter = Some(resolved),
+                    Err(err) => {
+                        eprintln!("{}", err);
+                        eprintln!("Run 'git-ai usage --help' for usage.");
+                        std::process::exit(1);
+                    }
+                }
             }
             other => {
                 eprintln!("Unknown argument: {}", other);
@@ -84,7 +114,8 @@ pub fn handle_usage(args: &[String]) {
 
     // Fetch events once and derive both views from the same snapshot so the
     // per-repo breakdown totals are always consistent with the headline stats.
-    let (stats, repos) = match compute_all(since_ts, period_label, granularity, None) {
+    let repo_filter_ref = repo_filter.as_deref();
+    let (stats, repos) = match compute_all(since_ts, period_label, granularity, repo_filter_ref) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -131,6 +162,22 @@ pub fn handle_usage(args: &[String]) {
     }
 }
 
+
+
+fn resolve_repo_filter(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Invalid --repo value: empty string.".to_string());
+    }
+    if trimmed.contains("://") || trimmed.starts_with("git@") || trimmed.starts_with("ssh://") {
+        return crate::repo_url::normalize_repo_url(trimmed);
+    }
+    let repo = find_repository_in_path(trimmed)
+        .map_err(|_| format!("No git repository found at path '{}'.", value))?;
+    crate::repo_url::resolve_repo_url_from_repo(&repo)
+        .ok_or_else(|| format!("Failed to resolve repository URL from path '{}'.", value))
+}
+
 fn days_ago(days: u64) -> u32 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -146,6 +193,7 @@ fn print_help() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --period <1d|3d|7d|30d>           Time window (default: 30d)");
+    eprintln!("  --repo <url|path>                 Filter to one repository");
     eprintln!("  --json                            Output as JSON");
     eprintln!("  --help                            Show this help");
     eprintln!();
@@ -587,6 +635,14 @@ mod tests {
         assert_eq!(
             result,
             Err("Invalid --period value: 90d. Expected one of 1d, 3d, 7d, 30d.".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_repo_filter_accepts_url_and_path_forms() {
+        assert_eq!(
+            resolve_repo_filter("https://github.com/org/repo.git").unwrap(),
+            "https://github.com/org/repo"
         );
     }
 }
