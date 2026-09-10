@@ -4,7 +4,7 @@ use crate::git::repository::find_repository_in_path;
 use crate::metrics::local_stats::{
     BucketGranularity, LocalActivityStats, RepoActivitySummary, compute_all,
 };
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,17 +18,147 @@ struct UsageJsonOutput<'a> {
 
 const DEFAULT_PERIOD: &str = "30d";
 
-/// Map a `--period` token to its window length in days, display label, and bucket granularity.
-fn resolve_period(token: &str) -> Result<(u64, String, BucketGranularity), String> {
+/// A resolved `--period` value: an epoch-second window plus display metadata.
+#[derive(Debug, PartialEq)]
+struct PeriodSpec {
+    /// Inclusive window start (Unix seconds). Date forms use local midnight.
+    since_ts: u32,
+    /// Exclusive upper bound (Unix seconds), or `None` for "now".
+    ///
+    /// For an explicit range this is local midnight of the day *after* the
+    /// range's end date, so the end date itself is fully included.
+    until_ts: Option<u32>,
+    label: String,
+    granularity: BucketGranularity,
+}
+
+/// The error message for a `--period` token none of the accepted forms matches.
+fn invalid_period(token: &str) -> String {
+    format!(
+        "Invalid --period value: {token}. Expected one of 1d, 3d, 7d, 30d, or Nd days, or a date or range as YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD."
+    )
+}
+
+/// Map a `--period` token to a resolved measurement window.
+///
+/// Accepts a fixed token (`1d`/`3d`/`7d`/`30d`), an arbitrary day count
+/// (`Nd`), a single date (`YYYY-MM-DD`, from local midnight to now), or an
+/// inclusive date range (`YYYY-MM-DD..YYYY-MM-DD`, which may end before today).
+fn resolve_period(token: &str) -> Result<PeriodSpec, String> {
+    let fixed = |days: u64, label: &str, granularity: BucketGranularity| PeriodSpec {
+        since_ts: days_ago(days),
+        until_ts: None,
+        label: label.to_string(),
+        granularity,
+    };
     match token {
-        "1d" => Ok((1, "last 24 hours".to_string(), BucketGranularity::Daily)),
-        "3d" => Ok((3, "last 3 days".to_string(), BucketGranularity::Daily)),
-        "7d" => Ok((7, "last 7 days".to_string(), BucketGranularity::Daily)),
-        "30d" => Ok((30, "last 30 days".to_string(), BucketGranularity::Weekly)),
-        other => Err(format!(
-            "Invalid --period value: {}. Expected one of 1d, 3d, 7d, 30d.",
-            other
-        )),
+        "1d" => Ok(fixed(1, "last 24 hours", BucketGranularity::Daily)),
+        "3d" => Ok(fixed(3, "last 3 days", BucketGranularity::Daily)),
+        "7d" => Ok(fixed(7, "last 7 days", BucketGranularity::Daily)),
+        "30d" => Ok(fixed(30, "last 30 days", BucketGranularity::Weekly)),
+        // Range form: inclusive of both dates; `until_ts` is the midnight
+        // after the end date so the filter stays half-open. An end date in
+        // the future is not clamped — empty buckets render as usual.
+        _ if token.contains("..") => {
+            let (start_s, end_s) = token
+                .split_once("..")
+                .expect("token contains .. checked in the guard");
+            let parse_date = |s: &str| {
+                NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| invalid_period(token))
+            };
+            let start = parse_date(start_s)?;
+            let end = parse_date(end_s)?;
+            if start > end {
+                return Err(format!(
+                    "Invalid --period value: {token}. Range start must be at or before range end."
+                ));
+            }
+            let since_ts = date_midnight_ts(start).ok_or_else(|| invalid_period(token))?;
+            let until_ts = end
+                .succ_opt()
+                .and_then(date_midnight_ts)
+                .ok_or_else(|| invalid_period(token))?;
+            let span = (end - start).num_days() as u64 + 1;
+            Ok(PeriodSpec {
+                since_ts,
+                until_ts: Some(until_ts),
+                label: format_date_range_label(start, end),
+                granularity: granularity_for_span(span),
+            })
+        }
+        other => {
+            if let Some(days_s) = other.strip_suffix('d')
+                && !days_s.is_empty()
+                && days_s.bytes().all(|b| b.is_ascii_digit())
+            {
+                let days: u64 = days_s
+                    .parse()
+                    .expect("all-ASCII-digit string parses as u64");
+                if days == 0 {
+                    return Err(invalid_period(token));
+                }
+                return Ok(PeriodSpec {
+                    since_ts: days_ago(days),
+                    until_ts: None,
+                    label: format!("last {days} days"),
+                    granularity: granularity_for_span(days),
+                });
+            }
+            if let Ok(date) = NaiveDate::parse_from_str(token, "%Y-%m-%d") {
+                let today = Local::now().date_naive();
+                // Clamp future dates to a 1-day span; they still exit via the
+                // no-data path in handle_usage.
+                let span = ((today - date).num_days().max(0) as u64) + 1;
+                return Ok(PeriodSpec {
+                    since_ts: date_midnight_ts(date).ok_or_else(|| invalid_period(token))?,
+                    until_ts: None,
+                    label: format_date_range_label(date, today),
+                    granularity: granularity_for_span(span),
+                });
+            }
+            Err(invalid_period(token))
+        }
+    }
+}
+
+/// Epoch seconds of local midnight of `date`. Returns `None` for the (practically
+/// never observed) DST-gap midnight that has no valid local representation.
+fn date_midnight_ts(date: NaiveDate) -> Option<u32> {
+    Local
+        .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+        .single()
+        .map(|dt| dt.timestamp() as u32)
+}
+
+/// `"Sep 01 – Sep 08 2026"` — lowercase tone like the other labels; the start
+/// year is included only when it differs from the end year.
+fn format_date_range_label(start: NaiveDate, end: NaiveDate) -> String {
+    if start.year() == end.year() {
+        format!(
+            "{} – {} {}",
+            start.format("%b %d"),
+            end.format("%b %d"),
+            end.year()
+        )
+    } else {
+        format!(
+            "{} {} – {} {}",
+            start.format("%b %d"),
+            start.year(),
+            end.format("%b %d"),
+            end.year()
+        )
+    }
+}
+
+/// Pick the bucket granularity for a window of `days` days.
+fn granularity_for_span(days: u64) -> BucketGranularity {
+    if days <= 7 {
+        BucketGranularity::Daily
+    } else if days <= 35 {
+        BucketGranularity::Weekly
+    } else {
+        BucketGranularity::Monthly
     }
 }
 
@@ -78,16 +208,14 @@ pub fn handle_usage(args: &[String]) {
             _ if arg.starts_with("--period=") => {
                 period = arg["--period=".len()..].to_string();
             }
-            _ if arg.starts_with("--repo=") => {
-                match resolve_repo_filter(&arg["--repo=".len()..]) {
-                    Ok(resolved) => repo_filter = Some(resolved),
-                    Err(err) => {
-                        eprintln!("{}", err);
-                        eprintln!("Run 'git-ai usage --help' for usage.");
-                        std::process::exit(1);
-                    }
+            _ if arg.starts_with("--repo=") => match resolve_repo_filter(&arg["--repo=".len()..]) {
+                Ok(resolved) => repo_filter = Some(resolved),
+                Err(err) => {
+                    eprintln!("{}", err);
+                    eprintln!("Run 'git-ai usage --help' for usage.");
+                    std::process::exit(1);
                 }
-            }
+            },
             other => {
                 eprintln!("Unknown argument: {}", other);
                 eprintln!("Run 'git-ai usage --help' for usage.");
@@ -97,7 +225,7 @@ pub fn handle_usage(args: &[String]) {
         i += 1;
     }
 
-    let (days, period_label, granularity) = match resolve_period(&period) {
+    let spec = match resolve_period(&period) {
         Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("{}", e);
@@ -110,12 +238,16 @@ pub fn handle_usage(args: &[String]) {
     // before stats — and therefore cost estimates — are computed.
     crate::metrics::model_pricing::refresh_cache_if_stale();
 
-    let since_ts = days_ago(days);
-
     // Fetch events once and derive both views from the same snapshot so the
     // per-repo breakdown totals are always consistent with the headline stats.
     let repo_filter_ref = repo_filter.as_deref();
-    let (stats, repos) = match compute_all(since_ts, period_label, granularity, repo_filter_ref) {
+    let (stats, repos) = match compute_all(
+        spec.since_ts,
+        spec.until_ts,
+        spec.label,
+        spec.granularity,
+        repo_filter_ref,
+    ) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -162,8 +294,6 @@ pub fn handle_usage(args: &[String]) {
     }
 }
 
-
-
 fn resolve_repo_filter(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -192,10 +322,14 @@ fn print_help() {
     eprintln!("Usage: git-ai usage [options]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --period <1d|3d|7d|30d>           Time window (default: 30d)");
-    eprintln!("  --repo <url|path>                 Filter to one repository");
-    eprintln!("  --json                            Output as JSON");
-    eprintln!("  --help                            Show this help");
+    eprintln!("  --period <1d|3d|7d|30d|Nd|YYYY-MM-DD|YYYY-MM-DD..YYYY-MM-DD>");
+    eprintln!("                           Time window (default: 30d)");
+    eprintln!("  --repo <url|path>         Filter to one repository");
+    eprintln!("  --json                    Output as JSON");
+    eprintln!("  --help                    Show this help");
+    eprintln!();
+    eprintln!("Nd counts back N days from now. A single date runs from its local");
+    eprintln!("midnight to now; a range is inclusive of both dates.");
     eprintln!();
     eprintln!("Shows activity over the selected window from locally recorded metric events.");
     eprintln!("Metric rows older than approximately 365 days are pruned locally.");
@@ -605,10 +739,9 @@ mod tests {
     fn resolve_period_defaults_to_thirty_day_weekly_window() {
         let resolved = resolve_period(DEFAULT_PERIOD).unwrap();
 
-        assert_eq!(
-            resolved,
-            (30, "last 30 days".to_string(), BucketGranularity::Weekly)
-        );
+        assert_eq!(resolved.label, "last 30 days");
+        assert_eq!(resolved.granularity, BucketGranularity::Weekly);
+        assert_eq!(resolved.until_ts, None);
     }
 
     #[test]
@@ -618,24 +751,110 @@ mod tests {
             .map(|t| resolve_period(t).unwrap())
             .collect();
 
+        assert_eq!(resolved[0].label, "last 24 hours");
+        assert_eq!(resolved[1].label, "last 3 days");
+        assert_eq!(resolved[2].label, "last 7 days");
+        assert!(
+            resolved
+                .iter()
+                .all(|s| s.granularity == BucketGranularity::Daily)
+        );
+        assert!(resolved.iter().all(|s| s.until_ts.is_none()));
+    }
+
+    #[test]
+    fn resolve_period_rejects_malformed_token() {
+        let result = resolve_period("45x");
+
         assert_eq!(
-            resolved,
-            vec![
-                (1, "last 24 hours".to_string(), BucketGranularity::Daily),
-                (3, "last 3 days".to_string(), BucketGranularity::Daily),
-                (7, "last 7 days".to_string(), BucketGranularity::Daily),
-            ]
+            result,
+            Err(
+                "Invalid --period value: 45x. Expected one of 1d, 3d, 7d, 30d, or Nd days, or a date or range as YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD."
+                    .to_string()
+            )
         );
     }
 
     #[test]
-    fn resolve_period_rejects_unknown_token() {
-        let result = resolve_period("90d");
+    fn resolve_period_custom_day_counts_pick_granularity_by_span() {
+        let cases = [
+            ("8d", 8, BucketGranularity::Weekly),
+            ("35d", 35, BucketGranularity::Weekly),
+            ("36d", 36, BucketGranularity::Monthly),
+            ("90d", 90, BucketGranularity::Monthly),
+        ];
+        for (token, days, granularity) in cases {
+            let spec = resolve_period(token).unwrap();
+            assert_eq!(spec.granularity, granularity, "{token}");
+            assert_eq!(spec.label, format!("last {days} days"), "{token}");
+            assert_eq!(spec.until_ts, None, "{token}");
+            // seconds-based, so allow a 1s race between the two days_ago() calls.
+            assert!(
+                spec.since_ts.abs_diff(days_ago(days)) <= 1,
+                "{token}: since_ts drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_period_rejects_zero_days() {
+        let result = resolve_period("0d");
 
         assert_eq!(
             result,
-            Err("Invalid --period value: 90d. Expected one of 1d, 3d, 7d, 30d.".to_string())
+            Err(
+                "Invalid --period value: 0d. Expected one of 1d, 3d, 7d, 30d, or Nd days, or a date or range as YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD."
+                    .to_string()
+            )
         );
+    }
+
+    #[test]
+    fn resolve_period_single_date_starts_at_local_midnight() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+
+        let spec = resolve_period("2026-09-01").unwrap();
+
+        assert_eq!(spec.since_ts, date_midnight_ts(date).unwrap());
+        assert_eq!(spec.until_ts, None);
+        assert_eq!(
+            spec.label,
+            format_date_range_label(date, Local::now().date_naive())
+        );
+    }
+
+    #[test]
+    fn resolve_period_range_is_inclusive_with_exclusive_until() {
+        let spec = resolve_period("2026-08-01..2026-08-31").unwrap();
+
+        assert_eq!(
+            spec.since_ts,
+            date_midnight_ts(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()).unwrap()
+        );
+        assert_eq!(
+            spec.until_ts,
+            Some(date_midnight_ts(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()).unwrap())
+        );
+        assert_eq!(spec.label, "Aug 01 – Aug 31 2026");
+        assert_eq!(spec.granularity, BucketGranularity::Weekly);
+    }
+
+    #[test]
+    fn resolve_period_rejects_reversed_range() {
+        let result = resolve_period("2026-09-10..2026-09-01");
+
+        assert_eq!(
+            result,
+            Err("Invalid --period value: 2026-09-10..2026-09-01. Range start must be at or before range end."
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_period_rejects_unparseable_dates() {
+        assert!(resolve_period("2026-13-99").is_err());
+        assert!(resolve_period("10d..20d").is_err());
+        assert!(resolve_period("not-a-date").is_err());
     }
 
     #[test]
