@@ -1,0 +1,37 @@
+src/commands/usage.rs
+  s_a53ca9becf129f::t_5a374ea2a4c143 7,21-53,55-161,211-216,218,228,244-250,325-332,742-744,754-768,770-774,779-801,805-808,812-859
+src/daemon/telemetry_worker.rs
+  s_a53ca9becf129f::t_17f397e7fa3564 2179-2182,2356-2359,2440-2443,2521-2524,2580-2583,2733
+src/metrics/db.rs
+  s_a53ca9becf129f::t_f0a8c7d3a3f045 983-984,992,996-1011,1027-1030,2853,3095,3123,3138,3167,3172-3191
+src/metrics/local_stats.rs
+  s_a53ca9becf129f::t_48bb43b0ae51c4 40-41,194,201,204-205,211,216,218,228,358-360,401-408,410-419,427-429,440-442,446-447,458,653,658-663,849-850,854,864,877,882,888,894,902,915,1209,1224-1231,1250,1255,1257-1259,1270,1274-1275,1398,1447,1545,1581,1593-1719
+tests/daemon_mode.rs
+  s_a53ca9becf129f::t_3b2b2e6b959c53 8117,8153,8771
+tests/integration/bash_attribution.rs
+  s_a53ca9becf129f::t_f8819da4df66dd 999
+tests/integration/commit_metric_metadata.rs
+  s_a53ca9becf129f::t_f69ee154198042 56
+tests/integration/opencode.rs
+  s_a53ca9becf129f::t_9b728a724747b0 435
+tests/integration/token_usage.rs
+  s_a53ca9becf129f::t_c9a442951c3235 27
+tests/integration/usage_period.rs
+  s_a53ca9becf129f::t_890a48cc140bd3 4,113,117-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "575dced7ae0b51c2e6581e0bf9d5fc1689af7c2e",
+  "prompts": {},
+  "sessions": {
+    "s_a53ca9becf129f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6150e0e2-d13b-4f30-bd89-e3edf355b80a",
+        "model": "unknown"
+      },
+      "human_author": "Soulock <admin@5yweb.com>"
+    }
+  }
+}
