@@ -980,7 +980,8 @@ impl MetricsDatabase {
         Ok(count as usize)
     }
 
-    /// Query persisted metric rows since `since_ts` (Unix seconds).
+    /// Query persisted metric rows since `since_ts` (Unix seconds), optionally
+    /// capped by an exclusive `until_ts` upper bound.
     ///
     /// When `repo_filter` is `Some(url)`, only events matching that repo_url are returned.
     /// An empty string `""` is a sentinel meaning "events with no repo_url (NULL)".
@@ -988,19 +989,26 @@ impl MetricsDatabase {
     pub fn get_metric_history(
         &self,
         since_ts: u32,
+        until_ts: Option<u32>,
         repo_filter: Option<&str>,
         event_ids: &[u16],
     ) -> Result<Vec<MetricHistoryRecord>, GitAiError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT event_json, event_ts, event_kind FROM metrics WHERE event_ts IS NULL OR event_ts >= ?1 ORDER BY id ASC")?;
-        let rows = stmt.query_map(params![since_ts as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-            ))
-        })?;
+        let mut stmt = self.conn.prepare(
+            "SELECT event_json, event_ts, event_kind FROM metrics \
+                 WHERE (event_ts IS NULL OR event_ts >= ?1) \
+                 AND (event_ts IS NULL OR ?2 IS NULL OR event_ts < ?2) \
+                 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![since_ts as i64, until_ts.map(|t| t as i64)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )?;
 
         let mut records = Vec::new();
         for row in rows {
@@ -1016,7 +1024,10 @@ impl MetricsDatabase {
                 continue;
             };
 
-            if event.timestamp < since_ts || !event_ids.contains(&event.event_id) {
+            if event.timestamp < since_ts
+                || until_ts.is_some_and(|u| event.timestamp >= u)
+                || !event_ids.contains(&event.event_id)
+            {
                 continue;
             }
 
@@ -2839,7 +2850,7 @@ mod tests {
         assert_eq!(db.count().unwrap(), 1);
         assert_eq!(db.count_retryable().unwrap(), 0);
         assert!(db.dequeue_pending_batch(1).unwrap().is_empty());
-        assert_eq!(db.get_metric_history(0, None, &[1]).unwrap().len(), 1);
+        assert_eq!(db.get_metric_history(0, None, None, &[1]).unwrap().len(), 1);
 
         let (delivered_ts, attempts, last_sync_error): (Option<i64>, i64, Option<String>) = db
             .conn
@@ -3081,7 +3092,7 @@ mod tests {
         db.insert_events(&pending).unwrap();
 
         let records = db
-            .get_metric_history(0, Some("acme/project"), &[1, 4, 5])
+            .get_metric_history(0, None, Some("acme/project"), &[1, 4, 5])
             .unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].event_id, 1);
@@ -3109,7 +3120,7 @@ mod tests {
             .unwrap();
 
         let before = db
-            .get_metric_history(0, Some("acme/project"), &[4, 5])
+            .get_metric_history(0, None, Some("acme/project"), &[4, 5])
             .unwrap();
         assert_eq!(
             before
@@ -3124,7 +3135,7 @@ mod tests {
         assert_eq!(summary.updated, 2);
 
         let after = db
-            .get_metric_history(0, Some("acme/project"), &[4, 5])
+            .get_metric_history(0, None, Some("acme/project"), &[4, 5])
             .unwrap();
         assert_eq!(
             after
@@ -3153,9 +3164,29 @@ mod tests {
             .unwrap();
         assert_eq!(total_after_prune, 1);
 
-        let records = db.get_metric_history(0, None, &[1]).unwrap();
+        let records = db.get_metric_history(0, None, None, &[1]).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].ts, recent_event_ts);
+    }
+
+    #[test]
+    fn test_get_metric_history_respects_until_bound() {
+        let (mut db, _temp_dir) = create_test_db();
+
+        let old_ts = days_ago(1);
+        let future_ts = (unix_now().saturating_add(3600)).min(u32::MAX as u64) as u32;
+        db.insert_events(&[event_json(old_ts), event_json(future_ts)])
+            .unwrap();
+        let midpoint = old_ts.saturating_add(1800);
+
+        let bounded = db
+            .get_metric_history(0, Some(midpoint), None, &[1])
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].ts, old_ts);
+
+        let unbounded = db.get_metric_history(0, None, None, &[1]).unwrap();
+        assert_eq!(unbounded.len(), 2);
     }
 
     #[test]

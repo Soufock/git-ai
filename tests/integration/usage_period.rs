@@ -1,7 +1,7 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use crate::test_utils::{extract_json_object, isolated_metrics_db_path};
-use chrono::NaiveDate;
+use chrono::{Datelike, Local, NaiveDate};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -110,11 +110,96 @@ fn usage_without_period_defaults_to_thirty_day_window() {
 fn usage_period_invalid_token_exits_nonzero_with_message() {
     let repo = TestRepo::new();
 
-    let result = repo.git_ai(&["usage", "--period", "90d"]);
+    let result = repo.git_ai(&["usage", "--period", "45x"]);
 
     let err = result.expect_err("an invalid --period value should exit non-zero");
     assert!(
-        err.contains("Invalid --period value: 90d. Expected one of 1d, 3d, 7d, 30d."),
+        err.contains("Invalid --period value: 45x. Expected one of 1d, 3d, 7d, 30d, or Nd days"),
+        "unexpected error output: {err}"
+    );
+}
+
+#[test]
+fn usage_period_accepts_custom_day_count() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    seed_ai_commit(&repo);
+
+    let value = usage_json(&repo, &metrics_db_path, &["--period", "90d"]);
+
+    assert_window(&value, "last 90 days", 90);
+}
+
+#[test]
+fn usage_period_accepts_single_date_form() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    seed_ai_commit(&repo);
+
+    let today = Local::now().date_naive();
+    let token = today.format("%Y-%m-%d").to_string();
+    // Same-day window: "Sep 10 – Sep 10 2026" (the same-year label form).
+    let label = format!(
+        "{} – {} {}",
+        today.format("%b %d"),
+        today.format("%b %d"),
+        today.year()
+    );
+
+    let value = usage_json(&repo, &metrics_db_path, &["--period", &token]);
+
+    assert_window(&value, &label, 1);
+}
+
+#[test]
+fn usage_period_accepts_range_form_ending_today() {
+    let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+    let repo =
+        TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
+    seed_ai_commit(&repo);
+
+    let today = Local::now().date_naive();
+    let start = today - chrono::Duration::days(7);
+    let token = format!("{}..{}", start.format("%Y-%m-%d"), today.format("%Y-%m-%d"));
+    // Inclusive 8-day range; same-year label form.
+    let label = format!(
+        "{} – {} {}",
+        start.format("%b %d"),
+        today.format("%b %d"),
+        today.year()
+    );
+
+    let value = usage_json(&repo, &metrics_db_path, &["--period", &token]);
+
+    assert_window(&value, &label, 8);
+}
+
+#[test]
+fn usage_period_reversed_range_exits_nonzero_with_message() {
+    let repo = TestRepo::new();
+
+    let result = repo.git_ai(&["usage", "--period", "2026-09-10..2026-09-01"]);
+
+    let err = result.expect_err("a reversed range should exit non-zero");
+    assert!(
+        err.contains("Invalid --period value: 2026-09-10..2026-09-01. Range start must be at or before range end."),
+        "unexpected error output: {err}"
+    );
+}
+
+#[test]
+fn usage_period_unparseable_date_exits_nonzero_with_message() {
+    let repo = TestRepo::new();
+
+    let result = repo.git_ai(&["usage", "--period", "2026-13-99"]);
+
+    let err = result.expect_err("an unparseable date should exit non-zero");
+    assert!(
+        err.contains(
+            "Invalid --period value: 2026-13-99. Expected one of 1d, 3d, 7d, 30d, or Nd days"
+        ),
         "unexpected error output: {err}"
     );
 }
