@@ -1,0 +1,71 @@
+src/metrics/local_stats.rs
+  s_65dbac266a0157::t_aa9eb5baf27f2e 846
+  s_65dbac266a0157::t_9f6d02c6ef6ecc 859,864,870,876,884,890-891,899
+  s_65dbac266a0157::t_6e9be5ff6a779a 1391,1440,1673
+  s_65dbac266a0157::t_d086028d309b2b 1193
+  s_65dbac266a0157::t_6895e92a2b648d 1234,1239,1241-1242
+  s_65dbac266a0157::t_9a68462f75fc2b 401,1208-1215,1473-1475
+  s_65dbac266a0157::t_951d6fcbf8efc9 1472,1476-1479,1481-1486,1492-1562,1565-1567,1569-1572,1574,1576-1579,1581-1602
+  s_65dbac266a0157::t_360006d78f4a8f 40-41
+  s_65dbac266a0157::t_730baf17543578 438-440
+  s_65dbac266a0157::t_ba6b8f3119e3a3 1468-1471,1480,1487-1491
+  s_65dbac266a0157::t_fc21f77fc81948 63-65
+  s_65dbac266a0157::t_126e7af684d958 197,204,207,213,218,220,230
+  s_65dbac266a0157::t_cf2048af7d2011 1709
+  s_65dbac266a0157::t_6297bc462fed21 831,835,838
+  s_65dbac266a0157::t_ee0f8e392718ea 409-410,413
+  s_65dbac266a0157::t_6b9ccca40c5328 90-93
+  s_65dbac266a0157::t_d50e4923a46bee 1253,1257-1258
+  s_65dbac266a0157::t_83f8bd0b8951ea 1345-1353,1357
+  s_65dbac266a0157::t_ffb5a2d15c29bf 1563-1564,1568,1573,1575,1580
+  s_65dbac266a0157::t_b1255bee2ed006 1344
+tests/integration/token_usage.rs
+  s_65dbac266a0157::t_7a8add50adf2f4 27
+src/daemon/telemetry_worker.rs
+  s_65dbac266a0157::t_9a68462f75fc2b 2179-2182,2356-2359,2440-2443,2521-2524,2580-2583,2733-2736
+src/metrics/db.rs
+  s_65dbac266a0157::t_50b6712081bffd 3171-3242
+  s_65dbac266a0157::t_9a68462f75fc2b 1021-1023,2847-2852
+  s_65dbac266a0157::t_7b1f11f9e6c0cd 3166
+  s_65dbac266a0157::t_c329ae9aa1ff6b 3094
+  s_65dbac266a0157::t_b3c8b80340d27c 983-984,992,998-999,1024
+  s_65dbac266a0157::t_778b9bb35d98c8 3122,3137
+tests/integration/commit_metric_metadata.rs
+  s_65dbac266a0157::t_b61da147b66462 56
+tests/integration/bash_attribution.rs
+  s_65dbac266a0157::t_6c3e91bb3237d0 999
+src/commands/usage.rs
+  s_65dbac266a0157::t_c423953abc9923 284-287
+  s_65dbac266a0157::t_15b7b0692408e2 699-700,705,714-716,723-739,741-742,744-748,752-794
+  s_65dbac266a0157::t_77c4786d913411 21-36,38-45,60-97,106-118
+  s_65dbac266a0157::t_e9fcba09f721b9 7
+  s_65dbac266a0157::t_bea7678e980a93 47-58
+  s_65dbac266a0157::t_1a3d1b9b6bc690 98-99
+  s_65dbac266a0157::t_4ec5a250ae7aa1 185-186
+  s_65dbac266a0157::t_a4c6c28f307005 263-275
+  s_65dbac266a0157::t_ae259ed376f4a6 100-105
+  s_65dbac266a0157::t_0d1db32f7ed8e2 46,59
+  s_65dbac266a0157::t_9a68462f75fc2b 168-173,175,201-208
+  s_65dbac266a0157::t_9011217f86aac6 795
+tests/daemon_mode.rs
+  s_65dbac266a0157::t_abdacf7abef563 8770
+  s_65dbac266a0157::t_35e76d0cbaf595 8117,8153
+tests/integration/opencode.rs
+  s_65dbac266a0157::t_0a094816615580 435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.3",
+  "base_commit_sha": "d0cd60bc2caab3c435f3d7da655ce821afaec3cb",
+  "prompts": {},
+  "sessions": {
+    "s_65dbac266a0157": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "86151b84-1089-4bdf-8ae9-686a8a578050",
+        "model": "deepseek-v4-flash"
+      },
+      "human_author": "刘剑华 <admin@5yweb.com>"
+    }
+  }
+}
