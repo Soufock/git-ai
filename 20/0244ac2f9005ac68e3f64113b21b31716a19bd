@@ -1,0 +1,20 @@
+tests/integration/usage_period.rs
+  s_65dbac266a0157::t_fb699a5d0ec462 138-141,184-187
+  s_65dbac266a0157::t_4372d2ac8b26ad 117-137,142-183,188-223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.7.3",
+  "base_commit_sha": "200244ac2f9005ac68e3f64113b21b31716a19bd",
+  "prompts": {},
+  "sessions": {
+    "s_65dbac266a0157": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "86151b84-1089-4bdf-8ae9-686a8a578050",
+        "model": "deepseek-v4-flash-0731"
+      },
+      "human_author": "刘剑华 <admin@5yweb.com>"
+    }
+  }
+}
