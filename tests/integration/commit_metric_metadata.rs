@@ -53,7 +53,7 @@ fn committed_metric_for_commit(db_path: &str, commit_sha: &str) -> MetricEvent {
         let db = MetricsDatabase::open_at_path(Path::new(db_path))
             .expect("metrics db should open at isolated path");
         let records = db
-            .get_metric_history(0, None, &[MetricEventId::Committed as u16])
+            .get_metric_history(0, u32::MAX, None, &[MetricEventId::Committed as u16])
             .expect("metric history should load");
         if let Some(record) = records.into_iter().find(|record| {
             sparse_str(&record.event.attrs, attr_pos::COMMIT_SHA) == Some(commit_sha)

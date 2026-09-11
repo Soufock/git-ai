@@ -24,7 +24,7 @@ fn isolated_metrics_db_path() -> (tempfile::TempDir, String) {
 fn token_usage_events(metrics_db_path: &str) -> Vec<MetricEvent> {
     let db = MetricsDatabase::open_at_path(Path::new(metrics_db_path))
         .expect("metrics db should open at isolated path");
-    db.get_metric_history(0, None, &[MetricEventId::TokenUsage as u16])
+    db.get_metric_history(0, u32::MAX, None, &[MetricEventId::TokenUsage as u16])
         .expect("token usage history should be readable")
         .into_iter()
         .map(|record| record.event)
