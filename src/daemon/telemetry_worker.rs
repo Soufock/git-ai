@@ -2176,7 +2176,10 @@ mod tests {
         assert_eq!(*uploaded.borrow(), vec![vec![ts2], vec![ts1]]);
         assert_eq!(db.borrow().count().unwrap(), 0);
         assert_eq!(
-            db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
+            db.borrow()
+                .get_metric_history(0, u32::MAX, None, &[1])
+                .unwrap()
+                .len(),
             2
         );
     }
@@ -2350,7 +2353,10 @@ mod tests {
         assert_eq!(*uploaded.borrow(), vec![ts]);
         assert_eq!(db.borrow().count().unwrap(), 0);
         assert_eq!(
-            db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
+            db.borrow()
+                .get_metric_history(0, u32::MAX, None, &[1])
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -2431,7 +2437,10 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
+            db.borrow()
+                .get_metric_history(0, u32::MAX, None, &[1])
+                .unwrap()
+                .len(),
             3
         );
     }
@@ -2509,7 +2518,10 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
+            db.borrow()
+                .get_metric_history(0, u32::MAX, None, &[1])
+                .unwrap()
+                .len(),
             2
         );
     }
@@ -2565,7 +2577,10 @@ mod tests {
         assert_eq!(db.borrow().count().unwrap(), 1);
         assert_eq!(db.borrow().count_retryable().unwrap(), 0);
         assert_eq!(
-            db.borrow().get_metric_history(0, None, &[1]).unwrap().len(),
+            db.borrow()
+                .get_metric_history(0, u32::MAX, None, &[1])
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -2715,7 +2730,10 @@ mod tests {
         );
         assert_eq!(*uploaded.borrow(), vec![vec![new_ts]]);
         assert_eq!(db.borrow().count().unwrap(), 1);
-        let history = db.borrow().get_metric_history(0, None, &[1]).unwrap();
+        let history = db
+            .borrow()
+            .get_metric_history(0, u32::MAX, None, &[1])
+            .unwrap();
         assert!(history.iter().any(|record| record.ts == old_ts));
     }
 

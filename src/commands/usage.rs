@@ -4,7 +4,7 @@ use crate::git::repository::find_repository_in_path;
 use crate::metrics::local_stats::{
     BucketGranularity, LocalActivityStats, RepoActivitySummary, compute_all,
 };
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,17 +18,104 @@ struct UsageJsonOutput<'a> {
 
 const DEFAULT_PERIOD: &str = "30d";
 
-/// Map a `--period` token to its window length in days, display label, and bucket granularity.
-fn resolve_period(token: &str) -> Result<(u64, String, BucketGranularity), String> {
+/// A parsed `--period` value: either a rolling window or explicit local dates.
+#[derive(Debug, PartialEq, Eq)]
+enum PeriodSpec {
+    /// `1d`/`3d`/`7d`/`30d` — rolling window ending now.
+    RelativeDays(u64),
+    /// `<YYYY-MM-DD>` — that day's local midnight through now.
+    Since(NaiveDate),
+    /// `<YYYY-MM-DD>..<YYYY-MM-DD>` — both days included.
+    Range(NaiveDate, NaiveDate),
+}
+
+const PERIOD_ERROR_HINT: &str =
+    "Expected one of 1d, 3d, 7d, 30d, <YYYY-MM-DD>, or <YYYY-MM-DD>..<YYYY-MM-DD>.";
+
+/// Parse a `--period` token: a relative window or an explicit date/date range.
+fn resolve_period(token: &str) -> Result<PeriodSpec, String> {
     match token {
-        "1d" => Ok((1, "last 24 hours".to_string(), BucketGranularity::Daily)),
-        "3d" => Ok((3, "last 3 days".to_string(), BucketGranularity::Daily)),
-        "7d" => Ok((7, "last 7 days".to_string(), BucketGranularity::Daily)),
-        "30d" => Ok((30, "last 30 days".to_string(), BucketGranularity::Weekly)),
-        other => Err(format!(
-            "Invalid --period value: {}. Expected one of 1d, 3d, 7d, 30d.",
-            other
-        )),
+        "1d" => return Ok(PeriodSpec::RelativeDays(1)),
+        "3d" => return Ok(PeriodSpec::RelativeDays(3)),
+        "7d" => return Ok(PeriodSpec::RelativeDays(7)),
+        "30d" => return Ok(PeriodSpec::RelativeDays(30)),
+        _ => {}
+    }
+
+    let invalid = || format!("Invalid --period value: {token}. {PERIOD_ERROR_HINT}");
+    let parse_date = |value: &str| {
+        // Enforce the strict `YYYY-MM-DD` shape first: chrono's parser is
+        // lenient about padding and would otherwise accept "2026-9-1".
+        let padded = value.len() == 10
+            && value.as_bytes()[4] == b'-'
+            && value.as_bytes()[7] == b'-'
+            && value[0..4].bytes().all(|b| b.is_ascii_digit())
+            && value[5..7].bytes().all(|b| b.is_ascii_digit())
+            && value[8..10].bytes().all(|b| b.is_ascii_digit());
+        if !padded {
+            return Err(invalid());
+        }
+        NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| invalid())
+    };
+
+    if let Some((start, end)) = token.split_once("..") {
+        let start = parse_date(start)?;
+        let end = parse_date(end)?;
+        if end < start {
+            return Err(format!(
+                "Invalid --period value: {token}. The end date must not precede the start date."
+            ));
+        }
+        return Ok(PeriodSpec::Range(start, end));
+    }
+
+    Ok(PeriodSpec::Since(parse_date(token)?))
+}
+
+/// Convert a resolved period into its `(since_ts, end_ts, label, granularity)`
+/// window. Date-based periods always bucket by day; relative windows keep their
+/// existing granularity (daily up to a week, weekly for the 30-day window).
+fn resolve_window(spec: PeriodSpec) -> (u32, u32, String, BucketGranularity) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(u32::MAX as u64) as u32;
+
+    match spec {
+        PeriodSpec::RelativeDays(days) => {
+            let label = match days {
+                1 => "last 24 hours",
+                3 => "last 3 days",
+                7 => "last 7 days",
+                _ => "last 30 days",
+            };
+            let granularity = if days <= 7 {
+                BucketGranularity::Daily
+            } else {
+                BucketGranularity::Weekly
+            };
+            // Derive both bounds from the same clock read so the window is
+            // exactly `days` long rather than a few microseconds longer.
+            (
+                now.saturating_sub((days * 24 * 3600).min(u32::MAX as u64) as u32),
+                now,
+                label.to_string(),
+                granularity,
+            )
+        }
+        PeriodSpec::Since(date) => (
+            date_to_ts(date, 0, 0, 0),
+            now,
+            format!("since {date}"),
+            BucketGranularity::Daily,
+        ),
+        PeriodSpec::Range(start, end) => (
+            date_to_ts(start, 0, 0, 0),
+            date_to_ts(end, 23, 59, 59),
+            format!("{start} to {end}"),
+            BucketGranularity::Daily,
+        ),
     }
 }
 
@@ -78,16 +165,14 @@ pub fn handle_usage(args: &[String]) {
             _ if arg.starts_with("--period=") => {
                 period = arg["--period=".len()..].to_string();
             }
-            _ if arg.starts_with("--repo=") => {
-                match resolve_repo_filter(&arg["--repo=".len()..]) {
-                    Ok(resolved) => repo_filter = Some(resolved),
-                    Err(err) => {
-                        eprintln!("{}", err);
-                        eprintln!("Run 'git-ai usage --help' for usage.");
-                        std::process::exit(1);
-                    }
+            _ if arg.starts_with("--repo=") => match resolve_repo_filter(&arg["--repo=".len()..]) {
+                Ok(resolved) => repo_filter = Some(resolved),
+                Err(err) => {
+                    eprintln!("{}", err);
+                    eprintln!("Run 'git-ai usage --help' for usage.");
+                    std::process::exit(1);
                 }
-            }
+            },
             other => {
                 eprintln!("Unknown argument: {}", other);
                 eprintln!("Run 'git-ai usage --help' for usage.");
@@ -97,8 +182,8 @@ pub fn handle_usage(args: &[String]) {
         i += 1;
     }
 
-    let (days, period_label, granularity) = match resolve_period(&period) {
-        Ok(resolved) => resolved,
+    let (since_ts, end_ts, period_label, granularity) = match resolve_period(&period) {
+        Ok(spec) => resolve_window(spec),
         Err(e) => {
             eprintln!("{}", e);
             eprintln!("Run 'git-ai usage --help' for usage.");
@@ -110,18 +195,17 @@ pub fn handle_usage(args: &[String]) {
     // before stats — and therefore cost estimates — are computed.
     crate::metrics::model_pricing::refresh_cache_if_stale();
 
-    let since_ts = days_ago(days);
-
     // Fetch events once and derive both views from the same snapshot so the
     // per-repo breakdown totals are always consistent with the headline stats.
     let repo_filter_ref = repo_filter.as_deref();
-    let (stats, repos) = match compute_all(since_ts, period_label, granularity, repo_filter_ref) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let (stats, repos) =
+        match compute_all(since_ts, end_ts, period_label, granularity, repo_filter_ref) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        };
 
     // Include human_lines/diff_added_lines so human-only periods aren't
     // falsely reported as empty (commits.total only counts AI-involved commits).
@@ -162,8 +246,6 @@ pub fn handle_usage(args: &[String]) {
     }
 }
 
-
-
 fn resolve_repo_filter(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -178,12 +260,19 @@ fn resolve_repo_filter(value: &str) -> Result<String, String> {
         .ok_or_else(|| format!("Failed to resolve repository URL from path '{}'.", value))
 }
 
-fn days_ago(days: u64) -> u32 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.saturating_sub(days * 24 * 3600).min(u32::MAX as u64) as u32
+/// Unix seconds for a local wall-clock time on `date`. Local times can be
+/// ambiguous or skipped by DST transitions, so prefer the earliest
+/// interpretation when the wall time does not resolve uniquely.
+fn date_to_ts(date: NaiveDate, hour: u32, min: u32, sec: u32) -> u32 {
+    let ndt = date
+        .and_hms_opt(hour, min, sec)
+        .expect("requested wall time is a valid 24h clock time");
+    Local
+        .from_local_datetime(&ndt)
+        .single()
+        .or_else(|| Local.from_local_datetime(&ndt).earliest())
+        .expect("local wall time should resolve to a timestamp")
+        .timestamp() as u32
 }
 
 fn print_help() {
@@ -192,7 +281,10 @@ fn print_help() {
     eprintln!("Usage: git-ai usage [options]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --period <1d|3d|7d|30d>           Time window (default: 30d)");
+    eprintln!("  --period <1d|3d|7d|30d|DATE|DATE..DATE>  Time window (default: 30d)");
+    eprintln!("                                     DATE is <YYYY-MM-DD>: a single date runs");
+    eprintln!("                                     from that day to now; a range is inclusive");
+    eprintln!("                                     of both days, e.g. 2026-09-01..2026-09-11");
     eprintln!("  --repo <url|path>                 Filter to one repository");
     eprintln!("  --json                            Output as JSON");
     eprintln!("  --help                            Show this help");
@@ -603,16 +695,14 @@ mod tests {
 
     #[test]
     fn resolve_period_defaults_to_thirty_day_weekly_window() {
-        let resolved = resolve_period(DEFAULT_PERIOD).unwrap();
-
         assert_eq!(
-            resolved,
-            (30, "last 30 days".to_string(), BucketGranularity::Weekly)
+            resolve_period(DEFAULT_PERIOD).unwrap(),
+            PeriodSpec::RelativeDays(30)
         );
     }
 
     #[test]
-    fn resolve_period_maps_short_windows_to_daily_granularity() {
+    fn resolve_period_maps_short_windows_to_relative_days() {
         let resolved: Vec<_> = ["1d", "3d", "7d"]
             .iter()
             .map(|t| resolve_period(t).unwrap())
@@ -621,21 +711,86 @@ mod tests {
         assert_eq!(
             resolved,
             vec![
-                (1, "last 24 hours".to_string(), BucketGranularity::Daily),
-                (3, "last 3 days".to_string(), BucketGranularity::Daily),
-                (7, "last 7 days".to_string(), BucketGranularity::Daily),
+                PeriodSpec::RelativeDays(1),
+                PeriodSpec::RelativeDays(3),
+                PeriodSpec::RelativeDays(7),
             ]
         );
     }
 
     #[test]
     fn resolve_period_rejects_unknown_token() {
-        let result = resolve_period("90d");
-
         assert_eq!(
-            result,
-            Err("Invalid --period value: 90d. Expected one of 1d, 3d, 7d, 30d.".to_string())
+            resolve_period("90d"),
+            Err(
+                "Invalid --period value: 90d. Expected one of 1d, 3d, 7d, 30d, \
+                 <YYYY-MM-DD>, or <YYYY-MM-DD>..<YYYY-MM-DD>."
+                    .to_string()
+            )
         );
+    }
+
+    #[test]
+    fn resolve_period_accepts_single_date() {
+        assert_eq!(
+            resolve_period("2026-09-01").unwrap(),
+            PeriodSpec::Since(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap())
+        );
+    }
+
+    #[test]
+    fn resolve_period_accepts_date_range() {
+        assert_eq!(
+            resolve_period("2026-09-01..2026-09-11").unwrap(),
+            PeriodSpec::Range(
+                NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 9, 11).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_period_rejects_unpadded_or_garbage_dates() {
+        for bad in ["2026-9-1", "foo", "2026-09-01..foo", "2026-09-01..2026-9-1"] {
+            assert!(resolve_period(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn resolve_period_rejects_reversed_range() {
+        assert!(resolve_period("2026-09-11..2026-09-01").is_err());
+    }
+
+    #[test]
+    fn resolve_window_maps_relative_and_date_specs() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+
+        // Relative windows stay anchored at "now", granularity by window length.
+        let (since, end, label, granularity) = resolve_window(PeriodSpec::RelativeDays(7));
+        assert!((end as i64 - now as i64).abs() <= 2);
+        assert_eq!(now.saturating_sub(since), 7 * 24 * 3600);
+        assert_eq!(label, "last 7 days");
+        assert_eq!(granularity, BucketGranularity::Daily);
+
+        // A single date starts at that day's local midnight and runs to now.
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let (since, end, label, granularity) = resolve_window(PeriodSpec::Since(date));
+        assert_eq!(since, date_to_ts(date, 0, 0, 0));
+        assert_eq!(label, "since 2026-09-01");
+        assert_eq!(granularity, BucketGranularity::Daily);
+        assert!((end as i64 - now as i64).abs() <= 2);
+
+        // A range is inclusive at both ends (end-of-day on the last day).
+        let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let end_date = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let (since, end, label, granularity) = resolve_window(PeriodSpec::Range(start, end_date));
+        assert_eq!(since, date_to_ts(start, 0, 0, 0));
+        assert_eq!(end, date_to_ts(end_date, 23, 59, 59));
+        assert_eq!(label, "2026-09-01 to 2026-09-11");
+        assert_eq!(granularity, BucketGranularity::Daily);
     }
 
     #[test]

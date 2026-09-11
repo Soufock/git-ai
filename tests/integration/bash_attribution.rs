@@ -996,7 +996,7 @@ fn wait_for_edge_recovery_metric(db_path: &str) -> MetricEvent {
         let db = MetricsDatabase::open_at_path(Path::new(db_path))
             .expect("metrics db should open at isolated path");
         let records = db
-            .get_metric_history(0, None, &[MetricEventId::Checkpoint as u16])
+            .get_metric_history(0, u32::MAX, None, &[MetricEventId::Checkpoint as u16])
             .expect("checkpoint metric history should load");
         if let Some(record) = records.into_iter().find(|record| {
             sparse_str(&record.event.values, checkpoint_pos::CHECKPOINT_TYPE)

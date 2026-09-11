@@ -37,7 +37,8 @@ pub struct LocalActivityStats {
     /// First day rendered in the calendar grid (window start, or earliest activity
     /// for the all-time window).
     pub calendar_start: NaiveDate,
-    /// Last day rendered in the calendar grid (today, local time).
+    /// Last day rendered in the calendar grid — the window end, which is today
+    /// for relative periods and the range's last day for date-bounded ones.
     pub calendar_end: NaiveDate,
     /// Derived headline stats for the compact summary block.
     pub summary: ActivitySummary,
@@ -59,7 +60,9 @@ pub struct DayActivity {
 pub struct ActivitySummary {
     /// Distinct local days with AI activity in the window.
     pub active_days: u32,
-    /// Days from the first active day through today, inclusive.
+    /// Length of the selected window in days — the denominator for
+    /// "active days X/Y". For the all-time window it is the span from the first
+    /// active day through the window end instead.
     pub total_days: u32,
     /// Longest run of consecutive active days.
     pub longest_streak: u32,
@@ -84,9 +87,10 @@ pub struct TokenSummary {
     pub estimated_cost_usd: f64,
     /// Per-model breakdown, sorted by total tokens descending.
     pub by_model: Vec<TokenModelStat>,
-    /// Week-over-week spend comparison (current 7 days vs previous 7 days).
-    /// None when either week has no cost data (e.g. viewing a period < 14 days
-    /// or when pricing is unavailable for all models).
+    /// Week-over-week spend comparison (current 7 days vs previous 7 days,
+    /// anchored at the window end — today for relative periods).
+    /// None when the window is shorter than 14 days or either week has no
+    /// cost data (e.g. pricing is unavailable for all models).
     pub wow_spend: Option<WowSpend>,
 }
 
@@ -190,28 +194,30 @@ const SESSION_RAW_JSON_KEY: &str = "0";
 /// Acquire the global DB lock and fetch metric history for the given window.
 fn fetch_metric_history(
     since_ts: u32,
+    end_ts: u32,
     repo_filter: Option<&str>,
 ) -> Result<Vec<MetricHistoryRecord>, GitAiError> {
     let db = MetricsDatabase::global()?;
     let db_lock = db
         .lock()
         .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))?;
-    db_lock.get_metric_history(since_ts, repo_filter, USAGE_EVENT_IDS)
+    db_lock.get_metric_history(since_ts, end_ts, repo_filter, USAGE_EVENT_IDS)
 }
 
-/// Aggregate metric history since `since_ts` (Unix seconds) into activity stats.
+/// Aggregate metric history within [`since_ts`, `end_ts`] into activity stats.
 ///
 /// When `repo_filter` is `Some(url)`, only events from that repository are
 /// aggregated. When `None`, events from all repositories are included.
 pub fn compute_activity(
     since_ts: u32,
+    end_ts: u32,
     period_label: String,
     granularity: BucketGranularity,
     repo_filter: Option<&str>,
 ) -> Result<LocalActivityStats, GitAiError> {
-    let records = fetch_metric_history(since_ts, repo_filter)?;
+    let records = fetch_metric_history(since_ts, end_ts, repo_filter)?;
     let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
-    compute_activity_from_records(&refs, since_ts, period_label, granularity)
+    compute_activity_from_records(&refs, since_ts, end_ts, period_label, granularity)
 }
 
 /// Aggregate a pre-fetched slice of `MetricHistoryRecord`s into activity stats.
@@ -221,6 +227,7 @@ pub fn compute_activity(
 fn compute_activity_from_records(
     records: &[&MetricHistoryRecord],
     since_ts: u32,
+    end_ts: u32,
     period_label: String,
     granularity: BucketGranularity,
 ) -> Result<LocalActivityStats, GitAiError> {
@@ -390,12 +397,8 @@ fn compute_activity_from_records(
     let mut session_by_tool: Vec<(String, u32)> = session_tool_counts.into_iter().collect();
     session_by_tool.sort_by_key(|&(_, count)| Reverse(count));
 
-    let now_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32;
     let (tokens, cost_by_day) =
-        build_token_summary(message_usage, codex_sessions, now_ts, since_ts);
+        build_token_summary(message_usage, codex_sessions, end_ts, since_ts);
 
     // Map by order key for fill_buckets to look up real data.
     let bucket_by_order: HashMap<i64, BucketAccum> = bucket_map
@@ -403,11 +406,11 @@ fn compute_activity_from_records(
         .map(|(label, accum)| (bucket_order[&label], accum))
         .collect();
 
-    // Fill in empty buckets between since_ts and now so the chart has no gaps.
-    let filled = fill_buckets(bucket_by_order, since_ts, granularity);
+    // Fill in empty buckets between since_ts and end_ts so the chart has no gaps.
+    let filled = fill_buckets(bucket_by_order, since_ts, end_ts, granularity);
 
     // ── Derived calendar + summary stats ──
-    let calendar_end = Local::now().date_naive();
+    let calendar_end = ts_to_local(end_ts).date_naive();
     // Earliest day with any activity — AI lines OR token spend — so a spend-only
     // day before the first AI-line day isn't clipped from the all-time window.
     let first_active = ai_lines_by_day
@@ -432,7 +435,9 @@ fn compute_activity_from_records(
             .map(|first| ((calendar_end - first).num_days() + 1).max(0) as u32)
             .unwrap_or(0)
     } else {
-        (now_ts.saturating_sub(since_ts) / 86_400).max(1)
+        // Ceiling division: a date-bounded window (start 00:00, end 23:59:59)
+        // spans exactly N*86400 - 1 seconds yet covers N calendar days.
+        (end_ts.saturating_sub(since_ts).saturating_add(86_399) / 86_400).max(1)
     };
     let (longest_streak, current_streak) = compute_streaks(&ai_lines_by_day, calendar_end);
     let most_active_day = ai_lines_by_day
@@ -823,13 +828,14 @@ fn bucket_key(dt: &DateTime<Local>, granularity: BucketGranularity) -> (String, 
     }
 }
 
-/// Fill gaps between `since_ts` and today so charts have contiguous buckets.
+/// Fill gaps between `since_ts` and `end_ts` so charts have contiguous buckets.
 fn fill_buckets(
     mut data_map: HashMap<i64, BucketAccum>,
     since_ts: u32,
+    end_ts: u32,
     granularity: BucketGranularity,
 ) -> Vec<BucketStats> {
-    let now = Local::now();
+    let end_date = ts_to_local(end_ts).date_naive();
     if since_ts == 0 && data_map.is_empty() {
         return Vec::new();
     }
@@ -837,7 +843,7 @@ fn fill_buckets(
         let earliest_order = data_map.keys().copied().min();
         earliest_order
             .and_then(|order| bucket_start_date(order, granularity))
-            .unwrap_or_else(|| now.date_naive())
+            .unwrap_or(end_date)
     } else {
         ts_to_local(since_ts).date_naive()
     };
@@ -850,26 +856,24 @@ fn fill_buckets(
         attributed_lines: accum.attributed,
     };
 
-    // Generate all expected bucket keys between since and now.
+    // Generate all expected bucket keys between since and end.
     let mut result = Vec::new();
     match granularity {
         BucketGranularity::Daily => {
             let mut day = since_date;
-            let today = now.date_naive();
-            while day <= today {
+            while day <= end_date {
                 let order = day.num_days_from_ce() as i64;
                 result.push(make(
                     bucket_label(day, granularity),
                     data_map.remove(&order).unwrap_or_default(),
                 ));
-                day = day.succ_opt().unwrap_or(today);
+                day = day.succ_opt().unwrap_or(end_date);
             }
         }
         BucketGranularity::Weekly => {
             let weekday = since_date.weekday().num_days_from_monday() as i64;
             let mut monday: NaiveDate = since_date - chrono::Duration::days(weekday);
-            let today = now.date_naive();
-            while monday <= today {
+            while monday <= end_date {
                 let order = monday.num_days_from_ce() as i64;
                 result.push(make(
                     bucket_label(monday, granularity),
@@ -877,14 +881,14 @@ fn fill_buckets(
                 ));
                 monday = monday
                     .checked_add_signed(chrono::Duration::weeks(1))
-                    .unwrap_or(today);
+                    .unwrap_or(end_date);
             }
         }
         BucketGranularity::Monthly => {
             let mut year = since_date.year();
             let mut month = since_date.month();
-            let now_year = now.year();
-            let now_month = now.month();
+            let end_year = end_date.year();
+            let end_month = end_date.month();
             loop {
                 let order = year as i64 * 12 + (month - 1) as i64;
                 let Some(date) = NaiveDate::from_ymd_opt(year, month, 1) else {
@@ -892,7 +896,7 @@ fn fill_buckets(
                 };
                 let label = bucket_label(date, granularity);
                 result.push(make(label, data_map.remove(&order).unwrap_or_default()));
-                if year == now_year && month == now_month {
+                if year == end_year && month == end_month {
                     break;
                 }
                 month += 1;
@@ -1186,6 +1190,7 @@ pub struct RepoActivitySummary {
 fn repo_summaries_from_records(
     all_records: &[MetricHistoryRecord],
     since_ts: u32,
+    end_ts: u32,
     granularity: BucketGranularity,
 ) -> Result<Vec<RepoActivitySummary>, GitAiError> {
     // Group records by repo_url, skipping events with no repo (NULL) — these
@@ -1200,9 +1205,14 @@ fn repo_summaries_from_records(
     let mut summaries: Vec<RepoActivitySummary> = by_repo
         .into_iter()
         .filter_map(|(url, records)| {
-            let stats =
-                compute_activity_from_records(&records, since_ts, String::new(), granularity)
-                    .ok()?;
+            let stats = compute_activity_from_records(
+                &records,
+                since_ts,
+                end_ts,
+                String::new(),
+                granularity,
+            )
+            .ok()?;
             Some(RepoActivitySummary {
                 repo_url: url.to_string(),
                 ai_lines: stats.commits.ai_lines,
@@ -1221,14 +1231,15 @@ fn repo_summaries_from_records(
 /// breakdown from the same snapshot, ensuring the two views are consistent.
 pub fn compute_all(
     since_ts: u32,
+    end_ts: u32,
     period_label: String,
     granularity: BucketGranularity,
     repo_filter: Option<&str>,
 ) -> Result<(LocalActivityStats, Vec<RepoActivitySummary>), GitAiError> {
-    let records = fetch_metric_history(since_ts, repo_filter)?;
+    let records = fetch_metric_history(since_ts, end_ts, repo_filter)?;
     let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
-    let stats = compute_activity_from_records(&refs, since_ts, period_label, granularity)?;
-    let repos = repo_summaries_from_records(&records, since_ts, granularity)?;
+    let stats = compute_activity_from_records(&refs, since_ts, end_ts, period_label, granularity)?;
+    let repos = repo_summaries_from_records(&records, since_ts, end_ts, granularity)?;
     Ok((stats, repos))
 }
 
@@ -1239,11 +1250,12 @@ pub fn compute_all(
 /// Sorted by `ai_lines` descending.
 pub fn compute_repo_summaries(
     since_ts: u32,
+    end_ts: u32,
     granularity: BucketGranularity,
     repo_filter: Option<&str>,
 ) -> Result<Vec<RepoActivitySummary>, GitAiError> {
-    let all_records = fetch_metric_history(since_ts, repo_filter)?;
-    repo_summaries_from_records(&all_records, since_ts, granularity)
+    let all_records = fetch_metric_history(since_ts, end_ts, repo_filter)?;
+    repo_summaries_from_records(&all_records, since_ts, end_ts, granularity)
 }
 
 #[cfg(test)]
@@ -1330,9 +1342,19 @@ mod tests {
         session_id: &str,
         model: &str,
     ) -> MetricHistoryRecord {
+        claude_session_with_message(ts, repo_url, session_id, model, "msg-1")
+    }
+
+    fn claude_session_with_message(
+        ts: u32,
+        repo_url: Option<&str>,
+        session_id: &str,
+        model: &str,
+        message_id: &str,
+    ) -> MetricHistoryRecord {
         let values = SessionEventValues::new(json!({
             "message": {
-                "id": "msg-1",
+                "id": message_id,
                 "role": "assistant",
                 "model": model,
                 "usage": {
@@ -1366,6 +1388,7 @@ mod tests {
         let stats = compute_activity_from_records(
             &refs,
             now.saturating_sub(24 * 3600),
+            now,
             "last 1 day".to_string(),
             BucketGranularity::Daily,
         )
@@ -1414,6 +1437,7 @@ mod tests {
         let stats = compute_activity_from_records(
             &refs,
             now.saturating_sub(24 * 3600),
+            now,
             "last 1 day".to_string(),
             BucketGranularity::Daily,
         )
@@ -1439,6 +1463,141 @@ mod tests {
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// Unix seconds for a local wall-clock time `days_back` days before today.
+    /// Local times can be ambiguous or skipped by DST transitions, so prefer
+    /// the earliest interpretation when the wall time does not resolve uniquely.
+    fn local_ts(days_back: i64, hour: u32, min: u32, sec: u32) -> u32 {
+        let date = Local::now().date_naive() - chrono::Duration::days(days_back);
+        let ndt = date
+            .and_hms_opt(hour, min, sec)
+            .expect("wall time is valid");
+        Local
+            .from_local_datetime(&ndt)
+            .single()
+            .or_else(|| Local.from_local_datetime(&ndt).earliest())
+            .expect("local wall time should resolve")
+            .timestamp() as u32
+    }
+
+    #[test]
+    fn compute_activity_uses_end_ts_as_window_terminus() {
+        // Window: two complete local days — the day before yesterday 00:00
+        // through yesterday 23:59:59 (what a `DATE..DATE` period produces).
+        // Records before `since` are the DB query's job to exclude; here only
+        // in-window records are aggregated.
+        let since = local_ts(2, 0, 0, 0);
+        let end = local_ts(1, 23, 59, 59);
+        let repo = "github.com/acme/project";
+        let records = [
+            committed(since + 60, repo, 10, 0, 10), // day -2
+            committed(end - 60, repo, 20, 0, 20),   // day -1
+        ];
+        let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
+
+        let stats = compute_activity_from_records(
+            &refs,
+            since,
+            end,
+            "2026-09-10 to 2026-09-11".to_string(),
+            BucketGranularity::Daily,
+        )
+        .unwrap();
+
+        // Calendar spans exactly the window, not through today.
+        assert_eq!(stats.calendar_start, ts_to_local(since).date_naive());
+        assert_eq!(stats.calendar_end, ts_to_local(end).date_naive());
+        assert_eq!(stats.summary.total_days, 2);
+        assert_eq!(stats.summary.active_days, 2);
+        // Bucket fill stops at the end date: exactly two daily buckets.
+        assert_eq!(stats.buckets.len(), 2);
+        let mut totals: Vec<u32> = stats.buckets.iter().map(|b| b.ai_lines).collect();
+        totals.sort_unstable();
+        assert_eq!(totals, vec![10, 20]);
+    }
+
+    #[test]
+    fn fill_buckets_with_historical_end_stops_in_end_week() {
+        // Fixed historical window — Monday 2026-08-31 through the following
+        // Tuesday 2026-09-08 — so expectations never depend on the real date.
+        let midnight = |date: NaiveDate| -> u32 {
+            let ndt = date.and_hms_opt(0, 0, 0).expect("midnight is a valid time");
+            Local
+                .from_local_datetime(&ndt)
+                .single()
+                .or_else(|| Local.from_local_datetime(&ndt).earliest())
+                .expect("local midnight should resolve")
+                .timestamp() as u32
+        };
+        let since = midnight(day(2026, 8, 31));
+        let end = midnight(day(2026, 9, 8));
+        let repo = "github.com/acme/project";
+        let records = [
+            committed(since + 60, repo, 10, 0, 10),
+            committed(end - 60, repo, 20, 0, 20),
+        ];
+        let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
+
+        let stats = compute_activity_from_records(
+            &refs,
+            since,
+            end,
+            "2026-08-31 to 2026-09-08".to_string(),
+            BucketGranularity::Weekly,
+        )
+        .unwrap();
+
+        // Weeks anchored on Monday: Aug 31 week and Sep 07 week. The fill must
+        // not reach the following week regardless of how far today is.
+        assert_eq!(stats.buckets.len(), 2);
+        assert_eq!(stats.calendar_end, day(2026, 9, 8));
+        assert_eq!(stats.summary.total_days, 8);
+    }
+
+    #[test]
+    fn wow_spend_anchors_at_window_end_not_today() {
+        // A 15-day window that ended 8 days ago. Anchored at the real "now"
+        // neither session would land in this/last week and wow_spend would be
+        // None; anchored at the window end, both weeks must have spend.
+        // Message ids must differ: token usage is deduped per message id.
+        let end = local_ts(8, 0, 0, 0);
+        let since = end.saturating_sub(15 * 24 * 3600);
+        let repo = "github.com/acme/project";
+        let records = [
+            claude_session_with_message(
+                end.saturating_sub(6 * 24 * 3600),
+                Some(repo),
+                "session-this-week",
+                "claude-fable-5-20260607",
+                "msg-this-week",
+            ),
+            claude_session_with_message(
+                end.saturating_sub(9 * 24 * 3600),
+                Some(repo),
+                "session-last-week",
+                "claude-fable-5-20260607",
+                "msg-last-week",
+            ),
+        ];
+        let refs: Vec<&MetricHistoryRecord> = records.iter().collect();
+
+        let stats = compute_activity_from_records(
+            &refs,
+            since,
+            end,
+            "last 15 days".to_string(),
+            BucketGranularity::Daily,
+        )
+        .unwrap();
+
+        let wow = stats
+            .tokens
+            .wow_spend
+            .expect("a 15-day window ending in the past must still produce WoW spend");
+        assert!(wow.this_week_usd > 0.0);
+        assert!(wow.last_week_usd > 0.0);
+        assert!(wow.change_pct.is_some());
     }
 
     #[test]
@@ -1511,6 +1670,7 @@ mod tests {
         let stats = compute_activity_from_records(
             &refs,
             now.saturating_sub(24 * 3600),
+            now,
             "last 1 day".to_string(),
             BucketGranularity::Daily,
         )
@@ -1546,6 +1706,7 @@ mod tests {
         let summaries = repo_summaries_from_records(
             &records,
             now.saturating_sub(24 * 3600),
+            now,
             BucketGranularity::Daily,
         )
         .unwrap();

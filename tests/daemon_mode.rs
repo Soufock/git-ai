@@ -8114,7 +8114,7 @@ fn daemon_ingest_losses_reported_to_metrics_db_on_shutdown() {
     let db = MetricsDatabase::open_at_path(&metrics_db_path)
         .expect("metrics db should open at isolated path");
     let records = db
-        .get_metric_history(0, None, &[8u16])
+        .get_metric_history(0, u32::MAX, None, &[8u16])
         .expect("metric history should load");
     assert_eq!(
         records.len(),
@@ -8150,7 +8150,7 @@ fn daemon_ingest_losses_reported_to_metrics_db_on_shutdown() {
     let clean_db = MetricsDatabase::open_at_path(&clean_metrics_db_path)
         .expect("clean metrics db should open");
     let clean_records = clean_db
-        .get_metric_history(0, None, &[8u16])
+        .get_metric_history(0, u32::MAX, None, &[8u16])
         .expect("metric history should load");
     assert!(
         clean_records.is_empty(),
@@ -8767,6 +8767,7 @@ const y = 2;
     let produced = db
         .get_metric_history(
             0,
+            u32::MAX,
             None,
             &[git_ai::metrics::types::MetricEventId::TokenUsage as u16],
         )

@@ -432,7 +432,7 @@ fn test_opencode_e2e_checkpoint_and_commit() {
     let emitted_session_event = loop {
         let metrics = MetricsDatabase::open_at_path(Path::new(&metrics_db_path)).unwrap();
         let session_events = metrics
-            .get_metric_history(0, None, &[MetricEventId::SessionEvent as u16])
+            .get_metric_history(0, u32::MAX, None, &[MetricEventId::SessionEvent as u16])
             .unwrap();
         if session_events.iter().any(|record| {
             record
